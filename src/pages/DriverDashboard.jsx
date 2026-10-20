@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   ArrowLeft,
@@ -8,8 +9,10 @@ import {
   RefreshCw,
   Play,
   Flag,
+  MapPin,
 } from 'lucide-react'
 import api from '../services/api'
+import socket from '../services/socket'
 
 export default function DriverDashboard() {
   const [rides, setRides] = useState([])
@@ -17,12 +20,14 @@ export default function DriverDashboard() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [actionId, setActionId] = useState(null)
+  const [sharingRideId, setSharingRideId] = useState(null)
+  const [locationError, setLocationError] = useState('')
+  const locationWatchRef = useRef(null)
 
   const fetchRides = async () => {
     try {
       setError('')
 
-      // Fetch available rides and rides assigned to this driver.
       const [availableResponse, driverResponse] = await Promise.all([
         api.get('/rides/available'),
         api.get('/rides/driver-rides'),
@@ -31,7 +36,6 @@ export default function DriverDashboard() {
       const availableRides = availableResponse.data.rides || []
       const driverRides = driverResponse.data.rides || []
 
-      // Merge both lists without duplicate ride IDs.
       const uniqueRides = new Map()
 
       ;[...availableRides, ...driverRides].forEach((ride) => {
@@ -57,6 +61,63 @@ export default function DriverDashboard() {
     fetchRides()
   }, [])
 
+  // Listen for real-time ride updates
+  useEffect(() => {
+    const handleRideUpdate = (data) => {
+      const updatedRide = data?.ride
+
+      if (!updatedRide?.id) return
+
+      setRides((previousRides) =>
+        previousRides.map((ride) =>
+          String(ride.id) === String(updatedRide.id)
+            ? { ...ride, ...updatedRide }
+            : ride
+        )
+      )
+
+      setNotice(
+        data.message ||
+          `Ride #${updatedRide.id} status updated: ${updatedRide.status}`
+      )
+
+      fetchRides()
+    }
+
+    const handleNewRideRequest = (data) => {
+      setNotice(data?.message || 'A new ride request is available')
+      fetchRides()
+    }
+
+    socket.on('ride-update', handleRideUpdate)
+    socket.on('new-ride-request', handleNewRideRequest)
+
+    return () => {
+      socket.off('ride-update', handleRideUpdate)
+      socket.off('new-ride-request', handleNewRideRequest)
+    }
+  }, [])
+
+  // Join Socket.IO rooms for the driver's rides
+  useEffect(() => {
+    const joinRideRooms = () => {
+      rides.forEach((ride) => {
+        socket.emit('join-ride', ride.id)
+      })
+    }
+
+    if (socket.connected) {
+      joinRideRooms()
+    }
+
+    socket.on('connect', joinRideRooms)
+
+    return () => {
+      socket.off('connect', joinRideRooms)
+    }
+  }, [rides])
+
+  // Accept, reject, start or complete a ride
   const handleRideAction = async (rideId, action) => {
     try {
       setActionId(rideId)
@@ -65,7 +126,19 @@ export default function DriverDashboard() {
 
       const response = await api.patch(`/rides/${rideId}/${action}`)
 
-      setNotice(response.data.message || 'Ride status updated successfully.')
+      setNotice(
+        response.data.message || 'Ride status updated successfully.'
+      )
+
+      // Stop GPS when the ride is completed or rejected
+      if (['complete', 'reject'].includes(action)) {
+        if (locationWatchRef.current !== null) {
+          navigator.geolocation.clearWatch(locationWatchRef.current)
+          locationWatchRef.current = null
+        }
+
+        setSharingRideId(null)
+      }
 
       await fetchRides()
     } catch (err) {
@@ -77,6 +150,79 @@ export default function DriverDashboard() {
       setActionId(null)
     }
   }
+
+  // Start or stop live driver location sharing
+  const handleLocationSharing = (rideId) => {
+    if (!navigator.geolocation) {
+      setLocationError(
+        'Your browser does not support GPS location.'
+      )
+      return
+    }
+
+    // Stop sharing if this ride is already being tracked
+    if (
+      String(sharingRideId) === String(rideId) &&
+      locationWatchRef.current !== null
+    ) {
+      navigator.geolocation.clearWatch(locationWatchRef.current)
+      locationWatchRef.current = null
+      setSharingRideId(null)
+      setNotice('Live location sharing stopped.')
+      return
+    }
+
+    // Stop any previous location tracking
+    if (locationWatchRef.current !== null) {
+      navigator.geolocation.clearWatch(locationWatchRef.current)
+      locationWatchRef.current = null
+    }
+
+    setLocationError('')
+    setSharingRideId(rideId)
+    setNotice('')
+
+    locationWatchRef.current = navigator.geolocation.watchPosition(
+      (position) => {
+        socket.emit('driver-location-update', {
+          rideId,
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        })
+
+        setLocationError('')
+      },
+      (gpsError) => {
+        setLocationError(
+          gpsError.code === 1
+            ? 'Location permission denied. Please allow location access.'
+            : 'Unable to get your location. Please try again.'
+        )
+
+        if (locationWatchRef.current !== null) {
+          navigator.geolocation.clearWatch(locationWatchRef.current)
+          locationWatchRef.current = null
+        }
+
+        setSharingRideId(null)
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 3000,
+        timeout: 15000,
+      }
+    )
+  }
+
+  // Clean up GPS tracking when the dashboard closes
+  useEffect(() => {
+    return () => {
+      if (locationWatchRef.current !== null) {
+        navigator.geolocation.clearWatch(locationWatchRef.current)
+        locationWatchRef.current = null
+      }
+    }
+  }, [])
 
   return (
     <div className="min-h-screen bg-slate-950 px-4 py-8 text-white sm:px-8">
@@ -127,6 +273,12 @@ export default function DriverDashboard() {
           </div>
         )}
 
+        {locationError && (
+          <div className="mb-6 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-red-300">
+            {locationError}
+          </div>
+        )}
+
         {loading ? (
           <div className="py-16 text-center text-slate-400">
             Loading rides...
@@ -157,14 +309,15 @@ export default function DriverDashboard() {
                 </div>
 
                 <div className="space-y-4">
-                    <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-4">
-  <p className="mb-1 text-xs uppercase tracking-wider text-slate-400">
-    Rider Details
-  </p>
-  <p className="text-lg font-semibold text-white">
-    {ride.rider_name || 'Rider name unavailable'}
-  </p>
-</div>
+                  <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-4">
+                    <p className="mb-1 text-xs uppercase tracking-wider text-slate-400">
+                      Rider Details
+                    </p>
+                    <p className="text-lg font-semibold text-white">
+                      {ride.rider_name || 'Rider name unavailable'}
+                    </p>
+                  </div>
+
                   <div>
                     <p className="mb-1 text-xs uppercase tracking-wider text-slate-500">
                       Pickup
@@ -179,28 +332,30 @@ export default function DriverDashboard() {
                     <p className="font-medium">{ride.dropoff_address}</p>
                   </div>
 
-                 <div className="rounded-xl border border-green-500/20 bg-green-500/5 p-4">
-  <p className="mb-1 text-xs uppercase tracking-wider text-slate-400">
-    Estimated Fare
-  </p>
+                  <div className="rounded-xl border border-green-500/20 bg-green-500/5 p-4">
+                    <p className="mb-1 text-xs uppercase tracking-wider text-slate-400">
+                      Estimated Fare
+                    </p>
 
-  {ride.fare != null ? (
-    <p className="text-xl font-bold text-green-400">
-      ₹{Number(ride.fare).toFixed(2)}
-    </p>
-  ) : (
-    <p className="text-sm text-slate-400">
-      Fare not calculated yet
-    </p>
-  )}
-</div>
+                    {ride.fare != null ? (
+                      <p className="text-xl font-bold text-green-400">
+                        ₹{Number(ride.fare).toFixed(2)}
+                      </p>
+                    ) : (
+                      <p className="text-sm text-slate-400">
+                        Fare not calculated yet
+                      </p>
+                    )}
+                  </div>
                 </div>
 
                 <div className="mt-6 flex flex-wrap gap-3">
                   {ride.status === 'requested' && (
                     <>
                       <button
-                        onClick={() => handleRideAction(ride.id, 'accept')}
+                        onClick={() =>
+                          handleRideAction(ride.id, 'accept')
+                        }
                         disabled={actionId !== null}
                         className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-green-500 px-4 py-3 font-semibold text-slate-950 hover:bg-green-400 disabled:opacity-50"
                       >
@@ -209,7 +364,9 @@ export default function DriverDashboard() {
                       </button>
 
                       <button
-                        onClick={() => handleRideAction(ride.id, 'reject')}
+                        onClick={() =>
+                          handleRideAction(ride.id, 'reject')
+                        }
                         disabled={actionId !== null}
                         className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-red-500/40 px-4 py-3 font-semibold text-red-400 hover:bg-red-500/10 disabled:opacity-50"
                       >
@@ -221,7 +378,9 @@ export default function DriverDashboard() {
 
                   {ride.status === 'accepted' && (
                     <button
-                      onClick={() => handleRideAction(ride.id, 'start')}
+                      onClick={() =>
+                        handleRideAction(ride.id, 'start')
+                      }
                       disabled={actionId !== null}
                       className="flex w-full items-center justify-center gap-2 rounded-xl bg-blue-500 px-4 py-3 font-semibold text-white hover:bg-blue-400 disabled:opacity-50"
                     >
@@ -231,14 +390,39 @@ export default function DriverDashboard() {
                   )}
 
                   {ride.status === 'ongoing' && (
-                    <button
-                      onClick={() => handleRideAction(ride.id, 'complete')}
-                      disabled={actionId !== null}
-                      className="flex w-full items-center justify-center gap-2 rounded-xl bg-yellow-400 px-4 py-3 font-semibold text-slate-950 hover:bg-yellow-300 disabled:opacity-50"
-                    >
-                      <Flag size={18} />
-                      {actionId === ride.id ? 'Please wait...' : 'Complete Ride'}
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleLocationSharing(ride.id)}
+                        disabled={
+                          sharingRideId !== null &&
+                          String(sharingRideId) !== String(ride.id)
+                        }
+                        className={`flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 font-semibold transition disabled:opacity-50 ${
+                          String(sharingRideId) === String(ride.id)
+                            ? 'bg-red-600 text-white hover:bg-red-500'
+                            : 'bg-blue-500 text-white hover:bg-blue-400'
+                        }`}
+                      >
+                        <MapPin size={18} />
+                        {String(sharingRideId) === String(ride.id)
+                          ? 'Stop Live Location'
+                          : 'Share Live Location'}
+                      </button>
+
+                      <button
+                        onClick={() =>
+                          handleRideAction(ride.id, 'complete')
+                        }
+                        disabled={actionId !== null}
+                        className="flex w-full items-center justify-center gap-2 rounded-xl bg-yellow-400 px-4 py-3 font-semibold text-slate-950 hover:bg-yellow-300 disabled:opacity-50"
+                      >
+                        <Flag size={18} />
+                        {actionId === ride.id
+                          ? 'Please wait...'
+                          : 'Complete Ride'}
+                      </button>
+                    </>
                   )}
 
                   {['completed', 'cancelled', 'rejected'].includes(

@@ -6,6 +6,7 @@ import Signup from './pages/Signup'
 import RideBooking from './pages/RideBooking'
 import MyRides from './pages/MyRides'
 import DriverDashboard from './pages/DriverDashboard'
+import Profile from './pages/Profile'
 import { AuthProvider, useAuth } from './context/AuthContext'
 
 function ProtectedRoute({ children, allowedRoles }) {
@@ -72,37 +73,6 @@ function AppRoutes() {
 
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
-  )
-}
-
-function Profile() {
-  const { user, logout } = useAuth()
-
-  return (
-    <div className="min-h-screen bg-gray-950 p-8 text-white">
-      <div className="mx-auto max-w-xl rounded-2xl border border-gray-800 bg-gray-900 p-8">
-        <h1 className="text-3xl font-bold text-yellow-400">My Profile</h1>
-
-        <p className="mt-6">
-          <span className="text-gray-400">Name:</span> {user?.full_name}
-        </p>
-
-        <p className="mt-3">
-          <span className="text-gray-400">Email:</span> {user?.email}
-        </p>
-
-        <p className="mt-3">
-          <span className="text-gray-400">Role:</span> {user?.role}
-        </p>
-
-        <button
-          onClick={logout}
-          className="mt-8 rounded-lg bg-yellow-400 px-6 py-3 font-bold text-black hover:bg-yellow-300"
-        >
-          Logout
-        </button>
-      </div>
-    </div>
   )
 }
 
